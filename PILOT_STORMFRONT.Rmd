@@ -1,0 +1,624 @@
+---
+title: "STORMFRONT PILOT"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("tidyverse", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("quanteda", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("lda", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("LDAvis", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("topicmodels", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("stm", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("textmineR", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("stargazer", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("data.table", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("lubridate", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library("textclean", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+
+```
+
+## Data Cleaning 
+```{r}
+# Loading data 
+df_dates_1 <- read.csv("~/downloads/result_time.csv", stringsAsFactors=F)
+df_dates_2 <- test_dates <- read.csv("~/downloads/result_time_2.csv", stringsAsFactors=F)
+
+df_1 <- read.csv("~/downloads/result.csv", stringsAsFactors=F)
+df_2 <- read.csv("~/downloads/result_2.csv", stringsAsFactors=F)
+
+test <- rbind(df_1, df_2)
+test_dates <- rbind(df_dates_1, df_dates_2)
+
+# Cleaning
+df_text <- as.data.frame(str_replace(test[,2], "font-style:italic.*</div>", ""))
+colnames(df_text) <- "html"
+clean_list <- replace_html(df_text)
+clean_df <- df_text %>% mutate(clean = replace_html(html)) %>% select(-html)
+clean_df$clean <- gsub("\n", "", clean_df$clean)
+clean_df$clean <- gsub("Quote:", "", clean_df$clean)
+clean_df$clean <- gsub("Originally Posted by", "", clean_df$clean)
+x <- str_extract_all(test_dates$X0, "\\d{2}-\\d{2}-\\d{4}")
+
+# Removing null objects 
+y <- as.data.frame(x[lengths(x) != 0])
+
+# From wide to long format 
+z <- y %>% pivot_longer(y, cols = everything(), names_to = "date") %>% select(-date)
+
+# Combining dfs 
+final <- cbind(z, clean_df)  
+
+# Changing date name 
+colnames(final) <- c("date","text")
+
+# Converting to date object
+final$date <- mdy(final$date)
+
+# Adding "stormfront" as source and the forum name 
+final$source <- "Stormfront"
+final$forum <- "Whites becoming minority in the U.S. and Europe"
+
+# Removing duplicates 
+final <- final[-c(71:80, 151:160, 221:230, 241:250, 281:290, 321:330, 351:360, 361:370, 371:380, 421:430, 471:490, 551:560),]
+
+#write.csv(final, "Stormfront_2011_2021_Whites_Minority.csv") 
+```
+
+## Creating corpus/DFM in quanteda and then using LDAvis 
+
+```{r}
+# Loading data 
+stormfront<- read.csv("~/Documents/R/Dissertation/Data/Stormfront_2011_2021_Whites_Minority.csv", stringsAsFactors=F)
+
+stormfront$date <- as.Date(stormfront$date)
+
+# Plotting by month
+plot <- stormfront %>% mutate(Date = floor_date(date, "month")) %>% 
+  group_by(Date) %>% 
+  summarise(Posts = n()) %>%
+  ggplot(aes(x=Date, y=Posts)) + geom_col() +
+  theme_minimal()
+
+ggsave("Stormfront_posts.png", plot = plot)
+  
+# Creating corpus 
+text_corpus <- stormfront %>%
+  corpus() %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE,  padding = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(c(stopwords("en"), "white", "america", "europe", "like", "can", "one", "get", "etc", "zpg", "s", "l", "I", "w", "$", ">", "u.", "|", "ladylynn", "celticlady6", "=", "#x202c", "#x202a")) %>%
+  tokens_ngrams(n = 1:2) # up to bigrams 
+
+# Checking total number of words  
+sum(ntoken(text_corpus))
+
+# Checking average number of words per post
+mean(ntoken(text_corpus))
+
+# Checking average number of characters per post 
+mean(nchar(text_corpus))
+
+# Convert to dfm, stemming, and removing rarely occurring words
+sf_dfm <- text_corpus %>% dfm(stem = T) %>% dfm_trim(min_termfreq = 2) 
+
+sf_dfm <- text_corpus %>% dfm(stem = T)
+
+# Removing documents with zero terms 
+sf_dfm <- dfm_subset(sf_dfm, ntoken(sf_dfm) > 0)
+
+#Top features 
+topfeatures(sf_dfm)
+
+# Non-discriminative words in top - testing weighting 
+sf_dfm_weighted <- dfm_tfidf(sf_dfm)
+topfeatures(sf_dfm_weighted)
+
+# Convert to lda format
+sf_dfm_lda <- convert(sf_dfm, to = "lda")
+```
+
+# Function for converting model to theta and phi matrix 
+
+```{r}
+
+FormatRawLdaOutput <- function(lda_result, docnames, smooth=TRUE, softmax = FALSE){
+    
+    theta <- t(lda_result$document_sums)
+  
+  # Normalize topic vectors and doc vectors, smooth if necessary
+    if(smooth){ 
+      theta <- theta + 0.0001 
+    }
+    
+    if (softmax){
+      theta <- exp(theta) / Matrix::rowSums(exp(theta))
+    } else {
+      theta <- theta / Matrix::rowSums(theta)
+    }
+	rownames(theta) <- docnames
+	colnames(theta) <- paste("t_", 1:ncol(theta), sep="" )
+  
+  
+
+	phi <- lda_result$topics
+  
+	if(smooth){ 
+        phi <- phi + 0.0001 
+	}
+  
+	if (softmax) {
+	  phi <- exp(phi) / Matrix::rowSums(exp(phi))
+	  
+	} else {
+	  phi <- phi / Matrix::rowSums(phi)
+	  
+	}
+	rownames(phi) <- colnames(theta)
+
+  # pull theta and phi into the result
+	result <- list(theta=theta, phi=phi)
+  
+  # capture document_expects, if it exists 
+	# (document_expects is over multiple runs, document_sums is over a single run)
+  if(! is.null(dim(lda_result$document_expects))){
+    theta_expects <- t(lda_result$document_expects)
+    
+    if(smooth){ 
+      theta_expects <- theta_expects + 0.0001 
+    }
+    
+    if(softmax){
+      theta_expects <- exp(theta_expects) / Matrix::rowSums(exp(theta_expects))
+      
+    } else {
+      theta_expects <- theta_expects / Matrix::rowSums(theta_expects)
+      
+    }
+    
+    rownames(theta_expects) <- docnames
+    colnames(theta_expects) <- paste("t.", 1:ncol(theta_expects), sep="" )
+    
+    
+    
+    result$theta_expects <- theta_expects
+    
+  }
+	
+	
+  # add in other outputs that may be in the raw lda_result
+  additional_objects <- setdiff(names(lda_result), 
+                                c("document_sums", "topics", "topic_sums", 
+                                  "document_expects", "assignments"))
+  
+  additional_objects <- additional_objects[ ! is.na(additional_objects) ]
+  
+	if( length(additional_objects) > 0 ){ 
+        result$etc <- lda_result[ additional_objects ]
+	}
+
+  # return result
+	return(result)
+}
+
+# SOURCE: https://rdrr.io/github/ChengMengli/topic/src/R/FormatRawLdaOutput.R
+
+```
+
+## Setting tuning parameters for Model 1  
+
+```{r}
+
+# MCMC and model tuning parameters:
+
+# Model 1 
+K <- 5 # Number of topics
+G <- 2000 # Number of iterations
+alpha <- 0.003 # Prior for topic proportions
+eta <- 0.01 # Prior for topic distributions
+
+
+# Fit the model
+set.seed(123)
+t1 <- Sys.time() # Start timer
+
+fit <- lda.collapsed.gibbs.sampler(documents = sf_dfm_lda$documents, K = K,
+                                        vocab = sf_dfm_lda$vocab,
+                                       num.iterations = G, alpha = alpha,
+                                      eta = eta, initial = NULL, burnin = 0,
+                                       compute.log.likelihood = TRUE)
+ t2 <- Sys.time() # End timer
+ 
+ t2 - t1  # runtime approximately 1 minute
+ 
+# create the JSON object to feed the visualization:
+ 
+json <- createJSON(phi = t(apply(t(fit$topics) + eta, 2, function(x) x/sum(x))), 
+                   theta = t(apply(fit$document_sums + alpha, 2, function(x) x/sum(x))), 
+                  doc.length = ntoken(sf_dfm), 
+                   vocab = colnames(sf_dfm), 
+                   term.frequency = colSums(sf_dfm))
+
+serVis(json, out.dir = 'vis', open.browser = TRUE)
+
+# 'FormatRawLdaOutput' - DEPRECIATED AS OF JUNE 2021
+
+# Format the result to get phi and theta matrices
+lda <- FormatRawLdaOutput(lda_result=fit, docnames=rownames(sf_dfm), smooth=TRUE)
+
+# Get top terms per topic 
+top_terms <- GetTopTerms(phi = lda$phi, M = 10)
+
+# Column names 
+cols <- c("Topic 1","Topic 2","Topic 3", "Topic 4", "Topic 5")
+colnames(top_terms) <- cols
+
+stargazer(top_terms, type ="html", out = "models_1.htm",  title="Top Terms: Model 1", column.sep.width = "10pt")
+
+```
+
+## Setting tuning parameters for Model 2  
+
+```{r}
+
+# Model 2 
+K <- 30 # Number of topics
+G <- 2000 # Number of iterations
+alpha <- 0.003 # Prior for topic proportions
+eta <- 0.01 # Prior for topic distributions
+
+# Fit the model
+set.seed(123)
+t1 <- Sys.time() # Start timer
+
+fit_2 <- lda.collapsed.gibbs.sampler(documents = sf_dfm_lda$documents, K = K,
+                                        vocab = sf_dfm_lda$vocab,
+                                       num.iterations = G, alpha = alpha,
+                                      eta = eta, initial = NULL, burnin = 0,
+                                       compute.log.likelihood = TRUE)
+ t2 <- Sys.time() # End timer
+ 
+ t2 - t1  # runtime approximately 1 minute
+ 
+# create the JSON object to feed the visualization:
+ 
+json_2 <- createJSON(phi = t(apply(t(fit_2$topics) + eta, 2, function(x) x/sum(x))), 
+                   theta = t(apply(fit_2$document_sums + alpha, 2, function(x) x/sum(x))), 
+                  doc.length = ntoken(sf_dfm), 
+                   vocab = colnames(sf_dfm), 
+                   term.frequency = colSums(sf_dfm))
+
+serVis(json_2, out.dir = 'vis', open.browser = TRUE)
+
+# 'FormatRawLdaOutput' - DEPRECIATED AS OF JUNE 2021
+
+# Format the result to get phi and theta matrices 
+lda_2 <- FormatRawLdaOutput(lda_result=fit_2, docnames=rownames(sf_dfm), smooth=TRUE)
+
+# Get top terms per topic 
+ top_terms_2 <- GetTopTerms(phi = lda_2$phi, M = 10)
+
+# Column names 
+cols_2 <- c("Topic 1","Topic 2","Topic 3", "Topic 4", "Topic 5", "Topic 6", "Topic 7", "Topic 8", "Topic 9", "Topic 10", "Topic 11", "Topic 12", "Topic 13", "Topic 14", "Topic 15", "Topic 16", "Topic 17", "Topic 18", "Topic 19", "Topic 20", "Topic 21", "Topic 22", "Topic 23", "Topic 24", "Topic 25", "Topic 26", "Topic 27", "Topic 28", "Topic 29", "Topic 30")
+
+colnames(top_terms_2) <- cols_2
+
+stargazer(top_terms_2, type ="html", out = "models_2.htm",  title="Top Terms: Model 2", column.sep.width = "10pt")
+
+```
+
+## Setting tuning parameters for Model 3
+
+```{r}
+
+# Model 3
+K <- 20 # Number of topics
+G <- 2000 # Number of iterations
+alpha <- 0.003 # Prior for topic proportions
+eta <- 0.01 # Prior for topic distributions
+
+# Fit the model
+set.seed(123)
+t1 <- Sys.time() # Start timer
+
+fit_3 <- lda.collapsed.gibbs.sampler(documents = sf_dfm_lda$documents, K = K,
+                                        vocab = sf_dfm_lda$vocab,
+                                       num.iterations = G, alpha = alpha,
+                                      eta = eta, initial = NULL, burnin = 0,
+                                       compute.log.likelihood = TRUE)
+ t2 <- Sys.time() # End timer
+ 
+ t2 - t1  # runtime approximately 1 minute
+ 
+# create the JSON object to feed the visualization:
+ 
+json_3 <- createJSON(phi = t(apply(t(fit_3$topics) + eta, 2, function(x) x/sum(x))), 
+                   theta = t(apply(fit_3$document_sums + alpha, 2, function(x) x/sum(x))), 
+                  doc.length = ntoken(sf_dfm), 
+                   vocab = colnames(sf_dfm), 
+                   term.frequency = colSums(sf_dfm))
+
+serVis(json_3, out.dir = 'vis', open.browser = TRUE)
+
+
+# 'FormatRawLdaOutput' - DEPRECIATED AS OF JUNE 2021
+
+# Format the result to get phi and theta matrices
+lda_3 <- FormatRawLdaOutput(lda_result=fit_3, docnames=rownames(sf_dfm), smooth=TRUE)
+
+# Get top terms per topic 
+top_terms_3 <- GetTopTerms(phi = lda_3$phi, M = 10)
+
+# Column names 
+cols_3 <- c("Topic 1","Topic 2","Topic 3", "Topic 4", "Topic 5", "Topic 6", "Topic 7", "Topic 8", "Topic 9", "Topic 10", "Topic 11", "Topic 12", "Topic 13", "Topic 14", "Topic 15", "Topic 16", "Topic 17", "Topic 18", "Topic 19", "Topic 20")
+
+colnames(top_terms_3) <- cols_3
+
+stargazer(top_terms_3, type ="html", out = "models_3.htm",  title="Top Terms: Model 3", column.sep.width = "10pt")
+
+```
+
+## Here new non-distriminative stopwords are added ("people", "state", "population", "youtube" and "us")
+
+```{r}
+
+text_corpus_2 <- stormfront %>%
+  corpus() %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE,  padding = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(c(stopwords("en"), "white", "america", "europe", "like", "can", "one", "get", "etc", "zpg", "s", "l", "I", "w", "$", ">", "u.", "|", "ladylynn", "celticlady6", "celtic_red", "=", "#x202c", "#x202a", "people", "state", "population", "youtube", "us")) %>%
+  tokens_ngrams(n = 1:2) # up to bigrams 
+
+# Convert to dfm, stemming, and removing rarely occurring words
+sf_dfm_2 <- text_corpus_2 %>% dfm(stem = T) %>% dfm_trim(min_termfreq = 2) 
+
+# Checking total number of tokens 
+sum(ntoken(sf_dfm_2))
+
+# Checking total number of features 
+sum(nfeat(sf_dfm_2))
+
+# Adding new docvar with the original text
+docvars(sf_dfm_2, "text") <- stormfront$text
+docvars(sf_dfm_2)
+
+# Removing documents with zero terms 
+sf_dfm_2 <- dfm_subset(sf_dfm_2, ntoken(sf_dfm_2) > 0)
+
+# Convert to lda format
+sf_dfm_lda_2 <- convert(sf_dfm_2, to = "lda")
+
+# Model 4
+K <- 20 # Number of topics
+G <- 2000 # Number of iterations
+alpha <- 0.003 # Prior for topic proportions
+eta <- 0.01 # Prior for topic distributions
+
+# Fit the model
+set.seed(123)
+t1 <- Sys.time() # Start timer
+
+fit_4 <- lda.collapsed.gibbs.sampler(documents = sf_dfm_lda_2$documents, K = K,
+                                        vocab = sf_dfm_lda_2$vocab,
+                                       num.iterations = G, alpha = alpha,
+                                      eta = eta, initial = NULL, burnin = 0,
+                                       compute.log.likelihood = TRUE)
+
+ t2 <- Sys.time() # End timer
+ 
+ t2 - t1  # runtime approximately 1 minute
+ 
+# create the JSON object to feed the visualization:
+ 
+json_4 <- createJSON(phi = t(apply(t(fit_4$topics) + eta, 2, function(x) x/sum(x))), 
+                   theta = t(apply(fit_4$document_sums + alpha, 2, function(x) x/sum(x))), 
+                  doc.length = ntoken(sf_dfm_2), 
+                   vocab = colnames(sf_dfm_2), 
+                   term.frequency = colSums(sf_dfm_2))
+
+serVis(json_4, out.dir = 'vis', open.browser = TRUE)
+
+# 'FormatRawLdaOutput' - DEPRECIATED AS OF JUNE 2021
+
+# Format the result to get phi and theta matrices
+lda_4 <- FormatRawLdaOutput(lda_result=fit_4, docnames=rownames(sf_dfm_2), smooth=TRUE)
+
+# Get top terms per topic 
+top_terms_4 <- GetTopTerms(phi = lda_4$phi, M = 10)
+
+# Column names 
+cols_4 <- c("Topic 1","Topic 2","Topic 3", "Topic 4", "Topic 5", "Topic 6", "Topic 7", "Topic 8", "Topic 9", "Topic 10", "Topic 11", "Topic 12", "Topic 13", "Topic 14", "Topic 15", "Topic 16", "Topic 17", "Topic 18", "Topic 19", "Topic 20")
+
+colnames(top_terms_4) <- cols_4
+
+stargazer(top_terms_4, type ="html", out = "models_4.htm",  title="Top Terms: Model 4", column.sep.width = "10pt")
+
+```
+
+## In the final model, one more topic is added  
+
+```{r}
+
+# Model 5 - adding one topics
+
+K <- 21 # Number of topics
+G <- 2000 # Number of iterations
+alpha <- 0.003 # Prior for topic proportions
+eta <- 0.01 # Prior for topic distributions
+
+# Fit the model
+set.seed(123)
+t1 <- Sys.time() # Start timer
+
+fit_5 <- lda.collapsed.gibbs.sampler(documents = sf_dfm_lda_2$documents, K = K,
+                                        vocab = sf_dfm_lda_2$vocab,
+                                       num.iterations = G, alpha = alpha,
+                                      eta = eta, initial = NULL, burnin = 0,
+                                       compute.log.likelihood = TRUE)
+
+ t2 <- Sys.time() # End timer
+ 
+ t2 - t1  # runtime approximately 1 minute
+ 
+# create the JSON object to feed the visualization:
+ 
+json_5 <- createJSON(phi = t(apply(t(fit_5$topics) + eta, 2, function(x) x/sum(x))), 
+                   theta = t(apply(fit_5$document_sums + alpha, 2, function(x) x/sum(x))), 
+                  doc.length = ntoken(sf_dfm_2), 
+                   vocab = colnames(sf_dfm_2), 
+                   term.frequency = colSums(sf_dfm_2))
+
+serVis(json_5, out.dir = 'vis', open.browser = TRUE)
+
+# 'FormatRawLdaOutput' - DEPRECIATED AS OF JUNE 2021
+
+# Format the result to get phi and theta matrices
+lda_5 <- FormatRawLdaOutput(lda_result=fit_5, docnames=rownames(sf_dfm_2), smooth=TRUE)
+
+# Get top terms per topic 
+top_terms_5 <- GetTopTerms(phi = lda_5$phi, M = 10)
+
+# Column names 
+cols_5 <- c("Topic 1","Topic 2","Topic 3", "Topic 4", "Topic 5", "Topic 6", "Topic 7", "Topic 8", "Topic 9", "Topic 10", "Topic 11", "Topic 12", "Topic 13", "Topic 14", "Topic 15", "Topic 16", "Topic 17", "Topic 18", "Topic 19", "Topic 20", "Topic 21")
+
+colnames(top_terms_5) <- cols_5
+
+stargazer(top_terms_5, type ="html", out = "models_5.htm",  title="Top Terms: Model 5", column.sep.width = "10pt")
+
+```
+
+## Saving data 
+
+```{r}
+# Saving data 
+#Theta_LDA_5 <- lda_5$theta
+#Phi_LDA_5 <- lda_5$phi
+#Theta_expects_LDA_5 <- lda_5$theta_expects
+#theta <- as.data.frame(lda_5$theta_expects)
+#write.csv(theta, file = "PILOT_THETA_2", row.names = TRUE)
+#write.csv(top.words, file = "Top_Words", row.names = TRUE)
+#write.csv(json_5, file = "json_5", row.names = TRUE)
+#write.csv(Theta_LDA_5, file = "Theta_LDA_5", row.names = TRUE)
+#write.csv(Phi_LDA_5, file = "Phi_LDA_5", row.names = TRUE)
+#write.csv(Theta_expects_LDA_5, file = "Theta_expects_LDA_5", row.names = TRUE)
+
+# Loading data - this is the theta I use 
+test <- read.delim2("~/Documents/R/Dissertation/Data/PILOT_THETA", stringsAsFactors=F)
+colnames(test) <- "split"
+test_3 <- separate(data = test, col = split, into = c("Text","Topic 1","Topic 2","Topic 3", "Topic 4", "Topic 5", "Topic 6", "Topic 7", "Topic 8", "Topic 9", "Topic 10", "Topic 11", "Topic 12", "Topic 13", "Topic 14", "Topic 15", "Topic 16", "Topic 17", "Topic 18", "Topic 19", "Topic 20", "Topic 21", "index"), sep = "\\,")
+
+top.words <- read.delim2("~/Documents/R/MC4M1_Summative/Data/Top_Words", stringsAsFactors=F)
+
+```
+
+## Viewing documents with highest theta per topic
+
+```{r}
+# Creating new data frame with the texts from the final dfm
+docvar_extract <- docvars(sf_dfm_2)
+docvar_extract$index <- 1:653 # adding index
+
+#theta$index <- 1:653 # adding index
+
+# Assigning top words 
+top.words <- as.data.frame(top.topic.words(fit_5$topics, 15, by.score=TRUE))
+
+# Adding column names 
+cols_5 <- c("Topic 1","Topic 2","Topic 3", "Topic 4", "Topic 5", "Topic 6", "Topic 7", "Topic 8", "Topic 9", "Topic 10", "Topic 11", "Topic 12", "Topic 13", "Topic 14", "Topic 15", "Topic 16", "Topic 17", "Topic 18", "Topic 19", "Topic 20", "Topic 21")
+
+colnames(top.words) <- cols_5
+
+# Saving output
+stargazer(top.words, type ="html", out = "models_5_top_words.htm",  title="Top Terms: Model 5", column.sep.width = "10pt")
+
+# Creating vector with document_sums from output 
+document_sums <- fit_5$document_sums
+
+# Top (theta) documents per topic 
+
+# Topic 1 - Education / IQ 
+theta$index[which.max(theta$t.1)]
+docvar_extract %>% filter(index == 365) %>% pull(text)
+
+# Topic 2 - Relating to the BBC prompt first posted
+theta$index[which.max(theta$t.2)]
+docvar_extract %>% filter(index == 635) %>% pull(text)
+
+# Topic 3 - Mestizo  
+theta$index[which.max(theta$t.3)]
+docvar_extract %>% filter(index == 628) %>% pull(text)
+
+# Topic 4 - Islam  
+theta$index[which.max(theta$t.4)]
+docvar_extract %>% filter(index == 282) %>% pull(text)
+
+# Topic 5 - Mexico / family / contraception
+theta$index[which.max(theta$t.5)]
+docvar_extract %>% filter(index == 349) %>% pull(text)
+
+# Topic 6 - United States  
+theta$index[which.max(theta$t.6)]
+docvar_extract %>% filter(index == 186) %>% pull(text)
+
+# Topic 7 - Family life
+theta$index[which.max(theta$t.7)]
+docvar_extract %>% filter(index == 565) %>% pull(text)
+
+# Topic 8 - Europe
+theta$index[which.max(theta$t.8)]
+docvar_extract %>% filter(index == 624) %>% pull(text)
+
+# Topic 9 - Children/Family
+theta$index[which.max(theta$t.9)]
+docvar_extract %>% filter(index == 265) %>% pull(text)
+
+# Topic 10 - Antisemitic/Jewish
+theta$index[which.max(theta$t.10)]
+docvar_extract %>% filter(index == 467) %>% pull(text)
+
+# Topic 11 - Unknown
+theta$index[which.max(theta$t.11)]
+docvar_extract %>% filter(index == 521) %>% pull(text)
+
+# Topic 12 - Statisics
+theta$index[which.max(theta$t.12)]
+docvar_extract %>% filter(index == 653) %>% pull(text)
+
+# Topic 13 - Family life 2 
+theta$index[which.max(theta$t.13)]
+docvar_extract %>% filter(index == 460) %>% pull(text)
+
+# Topic 14 - Antisemitic/Jewish
+theta$index[which.max(theta$t.14)]
+docvar_extract %>% filter(index == 356) %>% pull(text)
+
+# Topic 15 - Immigration / State
+theta$index[which.max(theta$t.15)]
+docvar_extract %>% filter(index == 631) %>% pull(text)
+
+# Topic 16 - Europe
+theta$index[which.max(theta$t.16)]
+docvar_extract %>% filter(index == 624) %>% pull(text)
+
+# Topic 17 - Asia
+theta$index[which.max(theta$t.17)]
+docvar_extract %>% filter(index == 245) %>% pull(text)
+
+# Topic 18 - Immigration / Children / Welfare 
+theta$index[which.max(theta$t.18)]
+docvar_extract %>% filter(index == 245) %>% pull(text)
+
+# Topic 19 - largest topic
+theta$index[which.max(theta$t.19)]
+docvar_extract %>% filter(index == 568) %>% pull(text)
+
+# Topic 20 - Racial slurs 
+theta$index[which.max(theta$t.20)]
+docvar_extract %>% filter(index == 353) %>% pull(text)
+
+# Topic 21 - White pride
+theta$index[which.max(theta$t.21)]
+docvar_extract %>% filter(index == 91) %>% pull(text)
+
+```
+
